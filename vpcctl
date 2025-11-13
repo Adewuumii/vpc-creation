@@ -1,0 +1,882 @@
+#!/bin/bash
+
+set -e
+
+log_info() {
+    echo "[INFO] $1"
+}
+
+log_error() {
+    echo "[ERROR] $1"
+}
+
+log_warn() {
+    echo "[WARN] $1"
+}
+
+configure_nat() {
+    local VPC_CIDR=$1
+    local INTERNET_IFACE=$2
+    
+    log_info "Configuring NAT for $VPC_CIDR via $INTERNET_IFACE"
+    sudo sysctl -w net.ipv4.ip_forward=1 > /dev/null
+    sudo iptables -t nat -C POSTROUTING -s "$VPC_CIDR" -o "$INTERNET_IFACE" -j MASQUERADE 2>/dev/null || \
+    sudo iptables -t nat -A POSTROUTING -s "$VPC_CIDR" -o "$INTERNET_IFACE" -j MASQUERADE
+    log_info "NAT configured"
+}
+
+parse_json_policy() {
+    local POLICY_FILE=$1
+    
+    if [[ ! -f "$POLICY_FILE" ]]; then
+        log_error "Policy file not found: $POLICY_FILE"
+        return 1
+    fi
+    
+    if ! command -v jq &> /dev/null; then
+        log_error "jq is required for JSON parsing. Install with: sudo apt-get install jq"
+        return 1
+    fi
+    
+    if ! jq empty "$POLICY_FILE" 2>/dev/null; then
+        log_error "Invalid JSON in policy file"
+        return 1
+    fi
+    
+    return 0
+}
+
+apply_security_group() {
+    local VPC_NAME=$1
+    local SUBNET_NAME=$2
+    local POLICY_FILE=$3
+    
+    local NAMESPACE="${VPC_NAME}-${SUBNET_NAME}"
+    
+    if ! parse_json_policy "$POLICY_FILE"; then
+        return 1
+    fi
+    
+    log_info "Applying security group to $NAMESPACE from $POLICY_FILE"
+    
+    local SG_NAME=$(jq -r '.name // "unnamed"' "$POLICY_FILE")
+    local INGRESS_DEFAULT=$(jq -r '.default_policy.ingress // "DROP"' "$POLICY_FILE")
+    local EGRESS_DEFAULT=$(jq -r '.default_policy.egress // "ACCEPT"' "$POLICY_FILE")
+    
+    log_info "Security Group: $SG_NAME"
+    log_info "Default Ingress: $INGRESS_DEFAULT, Default Egress: $EGRESS_DEFAULT"
+    
+    sudo ip netns exec "$NAMESPACE" iptables -N SG-INGRESS 2>/dev/null || \
+    sudo ip netns exec "$NAMESPACE" iptables -F SG-INGRESS
+    
+    sudo ip netns exec "$NAMESPACE" iptables -N SG-EGRESS 2>/dev/null || \
+    sudo ip netns exec "$NAMESPACE" iptables -F SG-EGRESS
+    
+    # Add stateful connection tracking 
+    log_info "Adding connection tracking rules..."
+    sudo ip netns exec "$NAMESPACE" iptables -A SG-INGRESS -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    sudo ip netns exec "$NAMESPACE" iptables -A SG-EGRESS -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    
+    log_info "Applying ingress rules..."
+    local ingress_count=$(jq '.ingress | length' "$POLICY_FILE")
+    
+    for ((i=0; i<ingress_count; i++)); do
+        local port=$(jq -r ".ingress[$i].port // \"\"" "$POLICY_FILE")
+        local protocol=$(jq -r ".ingress[$i].protocol // \"\"" "$POLICY_FILE")
+        local source=$(jq -r ".ingress[$i].source // \"0.0.0.0/0\"" "$POLICY_FILE")
+        local action=$(jq -r ".ingress[$i].action" "$POLICY_FILE")
+        local comment=$(jq -r ".ingress[$i].comment // \"\"" "$POLICY_FILE")
+        
+        local rule_parts="-s $source"
+        
+        if [[ -n "$protocol" ]] && [[ "$protocol" != "null" ]]; then
+            rule_parts="$rule_parts -p $protocol"
+        fi
+        
+        if [[ -n "$port" ]] && [[ "$port" != "null" ]]; then
+            rule_parts="$rule_parts --dport $port"
+        fi
+        
+        rule_parts="$rule_parts -j $action"
+        
+        if [[ -n "$comment" ]] && [[ "$comment" != "null" ]]; then
+            rule_parts="$rule_parts -m comment --comment \"$comment\""
+        fi
+        
+        eval "sudo ip netns exec \"$NAMESPACE\" iptables -A SG-INGRESS $rule_parts"
+        log_info "  → Ingress: $comment"
+    done
+    
+    log_info "Applying egress rules..."
+    local egress_count=$(jq '.egress | length' "$POLICY_FILE")
+    
+    for ((i=0; i<egress_count; i++)); do
+        local port=$(jq -r ".egress[$i].port // \"\"" "$POLICY_FILE")
+        local protocol=$(jq -r ".egress[$i].protocol // \"\"" "$POLICY_FILE")
+        local dest=$(jq -r ".egress[$i].destination // \"0.0.0.0/0\"" "$POLICY_FILE")
+        local action=$(jq -r ".egress[$i].action" "$POLICY_FILE")
+        local comment=$(jq -r ".egress[$i].comment // \"\"" "$POLICY_FILE")
+        
+        local rule_parts="-d $dest"
+        
+        if [[ -n "$protocol" ]] && [[ "$protocol" != "null" ]]; then
+            rule_parts="$rule_parts -p $protocol"
+        fi
+        
+        if [[ -n "$port" ]] && [[ "$port" != "null" ]]; then
+            rule_parts="$rule_parts --dport $port"
+        fi
+        
+        rule_parts="$rule_parts -j $action"
+        
+        if [[ -n "$comment" ]] && [[ "$comment" != "null" ]]; then
+            rule_parts="$rule_parts -m comment --comment \"$comment\""
+        fi
+        
+        eval "sudo ip netns exec \"$NAMESPACE\" iptables -A SG-EGRESS $rule_parts"
+        log_info "  → Egress: $comment"
+    done
+    
+    sudo ip netns exec "$NAMESPACE" iptables -A SG-INGRESS -j "$INGRESS_DEFAULT"
+    sudo ip netns exec "$NAMESPACE" iptables -A SG-EGRESS -j "$EGRESS_DEFAULT"
+    
+    sudo ip netns exec "$NAMESPACE" iptables -D INPUT -j SG-INGRESS 2>/dev/null || true
+    sudo ip netns exec "$NAMESPACE" iptables -D OUTPUT -j SG-EGRESS 2>/dev/null || true
+    sudo ip netns exec "$NAMESPACE" iptables -D FORWARD -j SG-INGRESS 2>/dev/null || true
+    
+    sudo ip netns exec "$NAMESPACE" iptables -I INPUT 1 -j SG-INGRESS
+    sudo ip netns exec "$NAMESPACE" iptables -I OUTPUT 1 -j SG-EGRESS
+    sudo ip netns exec "$NAMESPACE" iptables -I FORWARD 1 -j SG-INGRESS
+    
+    mkdir -p .vpcctl-state
+    echo "$POLICY_FILE" > ".vpcctl-state/${VPC_NAME}-${SUBNET_NAME}.sg"
+    
+    log_info "Security group applied successfully to $NAMESPACE!"
+}
+
+list_security_groups() {
+    local VPC_NAME=$1
+    local SUBNET_NAME=$2
+    local NAMESPACE="${VPC_NAME}-${SUBNET_NAME}"
+    
+    if ! sudo ip netns list | grep -q "^${NAMESPACE}"; then
+        log_error "Namespace $NAMESPACE does not exist"
+        return 1
+    fi
+    
+    log_info "Security group rules for $NAMESPACE:"
+    echo ""
+    echo "=== INGRESS RULES (SG-INGRESS chain) ==="
+    sudo ip netns exec "$NAMESPACE" iptables -L SG-INGRESS -n -v --line-numbers 2>/dev/null || \
+    echo "No security group configured"
+    
+    echo ""
+    echo "=== EGRESS RULES (SG-EGRESS chain) ==="
+    sudo ip netns exec "$NAMESPACE" iptables -L SG-EGRESS -n -v --line-numbers 2>/dev/null || \
+    echo "No security group configured"
+}
+
+remove_security_group() {
+    local VPC_NAME=$1
+    local SUBNET_NAME=$2
+    local NAMESPACE="${VPC_NAME}-${SUBNET_NAME}"
+    
+    log_info "Removing security group from $NAMESPACE"
+    
+    sudo ip netns exec "$NAMESPACE" iptables -D INPUT -j SG-INGRESS 2>/dev/null || true
+    sudo ip netns exec "$NAMESPACE" iptables -D OUTPUT -j SG-EGRESS 2>/dev/null || true
+    sudo ip netns exec "$NAMESPACE" iptables -D FORWARD -j SG-INGRESS 2>/dev/null || true
+    
+    sudo ip netns exec "$NAMESPACE" iptables -F SG-INGRESS 2>/dev/null || true
+    sudo ip netns exec "$NAMESPACE" iptables -F SG-EGRESS 2>/dev/null || true
+    sudo ip netns exec "$NAMESPACE" iptables -X SG-INGRESS 2>/dev/null || true
+    sudo ip netns exec "$NAMESPACE" iptables -X SG-EGRESS 2>/dev/null || true
+    
+    rm -f ".vpcctl-state/${VPC_NAME}-${SUBNET_NAME}.sg"
+    
+    log_info "Security group removed successfully!"
+}
+
+deploy_app() {
+    local VPC_NAME=$1
+    local SUBNET_NAME=$2
+    local APP_TYPE=${3:-nginx}
+    local PORT=${4:-80}
+    
+    local NAMESPACE="${VPC_NAME}-${SUBNET_NAME}"
+    
+    if ! sudo ip netns list | grep -q "^${NAMESPACE}"; then
+        log_error "Namespace $NAMESPACE does not exist"
+        return 1
+    fi
+    
+    # Get subnet IP
+    local SUBNET_IP=$(sudo ip netns exec "$NAMESPACE" ip addr show | grep "inet " | grep -v "127.0.0.1" | awk '{print $2}' | cut -d'/' -f1)
+    
+    if [[ -z "$SUBNET_IP" ]]; then
+        log_error "Could not determine IP for $NAMESPACE"
+        return 1
+    fi
+    
+    log_info "Deploying $APP_TYPE to $NAMESPACE ($SUBNET_IP:$PORT)"
+    
+    if [[ "$APP_TYPE" == "nginx" ]]; then
+        # Check if nginx is installed
+        if ! command -v nginx &> /dev/null; then
+            log_info "Installing Nginx..."
+            sudo apt update > /dev/null 2>&1
+            sudo apt install -y nginx > /dev/null 2>&1
+        fi
+        
+        # Create HTML content
+        local WEB_ROOT="/var/www/${NAMESPACE}"
+        sudo mkdir -p "$WEB_ROOT"
+        echo "<h1>${VPC_NAME} - ${SUBNET_NAME} Subnet</h1><p>IP: ${SUBNET_IP}</p><p>Status: ✅ Online</p>" | sudo tee "${WEB_ROOT}/index.html" > /dev/null
+        log_info "Created web content at $WEB_ROOT"
+        
+        # Create nginx config
+        local NGINX_CONF="/tmp/nginx-${NAMESPACE}.conf"
+        sudo tee "$NGINX_CONF" > /dev/null <<NGINX_EOF
+        daemon off;
+        pid /tmp/nginx-${NAMESPACE}.pid;
+        error_log /tmp/nginx-${NAMESPACE}-error.log;
+        events { worker_connections 128; }
+    http {
+        access_log /tmp/nginx-${NAMESPACE}-access.log;
+        server {
+        listen ${SUBNET_IP}:${PORT};
+        root ${WEB_ROOT};
+        index index.html;
+        }
+    }
+NGINX_EOF
+        log_info "Created nginx config at $NGINX_CONF"
+        
+        # Kill any existing instance
+        sudo pkill -f "nginx.*${NAMESPACE}" 2>/dev/null || true
+        sleep 1
+        
+        # Start nginx in namespace
+        sudo ip netns exec "$NAMESPACE" nginx -c "$NGINX_CONF" > /dev/null 2>&1 &
+        sleep 1
+        
+        # Verify it's running
+        if ps aux | grep -q "nginx.*${NAMESPACE}"; then
+            log_info "✓ Nginx deployed successfully on ${SUBNET_IP}:${PORT}"
+            
+            # Save state
+            mkdir -p .vpcctl-state
+            echo "${APP_TYPE}|${PORT}" > ".vpcctl-state/${NAMESPACE}.app"
+        else
+            log_error "Failed to start nginx"
+            return 1
+        fi
+        
+        else
+        log_error "Unsupported app type: $APP_TYPE"
+        return 1
+        fi
+}
+
+cleanup_app() {
+    local VPC_NAME=$1
+    local SUBNET_NAME=$2
+    
+    local NAMESPACE="${VPC_NAME}-${SUBNET_NAME}"
+    
+    log_info "Cleaning up application in $NAMESPACE"
+    
+    # Stop nginx
+    sudo pkill -f "nginx.*${NAMESPACE}" 2>/dev/null || true
+    log_info "Stopped nginx process"
+    
+    # Remove config files
+    sudo rm -f /tmp/nginx-${NAMESPACE}.conf
+    sudo rm -f /tmp/nginx-${NAMESPACE}.pid
+    sudo rm -f /tmp/nginx-${NAMESPACE}-error.log
+    sudo rm -f /tmp/nginx-${NAMESPACE}-access.log
+    log_info "Removed nginx configurations"
+    
+    # Remove web content
+    sudo rm -rf /var/www/${NAMESPACE}
+    log_info "Removed web content"
+    
+    # Remove state file
+    rm -f ".vpcctl-state/${NAMESPACE}.app"
+    
+    log_info "Application cleanup complete for $NAMESPACE"
+}
+
+list_apps() {
+    log_info "Deployed applications:"
+    echo ""
+    
+    for app_file in .vpcctl-state/*.app; do
+        if [[ -f "$app_file" ]]; then
+            local NAMESPACE=$(basename "$app_file" .app)
+            local APP_INFO=$(cat "$app_file")
+            local APP_TYPE=$(echo "$APP_INFO" | cut -d'|' -f1)
+            local PORT=$(echo "$APP_INFO" | cut -d'|' -f2)
+            
+            # Get IP
+            local IP=$(sudo ip netns exec "$NAMESPACE" ip addr show 2>/dev/null | grep "inet " | grep -v "127.0.0.1" | awk '{print $2}' | cut -d'/' -f1 || echo "N/A")
+            
+            # Check if running
+            if ps aux | grep -q "nginx.*${NAMESPACE}"; then
+                echo "  ✓ $NAMESPACE - $APP_TYPE on $IP:$PORT (Running)"
+            else
+                echo "  ✗ $NAMESPACE - $APP_TYPE on $IP:$PORT (Stopped)"
+            fi
+        fi
+    done
+    
+    if ! ls .vpcctl-state/*.app 1> /dev/null 2>&1; then
+        echo "  No applications deployed"
+    fi
+}
+
+case "$1" in
+    create-vpc)
+        VPC_NAME=""
+        CIDR=""
+        
+        shift
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --name) VPC_NAME="$2"; shift 2 ;;
+                --cidr) CIDR="$2"; shift 2 ;;
+                *) log_error "Unknown option: $1"; exit 1 ;;
+            esac
+        done
+        
+        if [[ -z "$VPC_NAME" ]] || [[ -z "$CIDR" ]]; then
+            log_error "Missing required arguments"
+            echo "Usage: vpcctl create-vpc --name <name> --cidr <cidr>"
+            exit 1
+        fi
+        
+        if [[ -f ".vpcctl-state/${VPC_NAME}.vpc" ]]; then
+             log_warn "VPC $VPC_NAME already exists. Deleting old instance..."
+            $0 delete-vpc --name "$VPC_NAME"
+        fi
+
+        BRIDGE_NAME="${VPC_NAME}-br"
+        GATEWAY_IP="${CIDR%.*}.1/24"
+        
+        log_info "Creating VPC: $VPC_NAME with CIDR: $CIDR"
+        
+        if ip link show "$BRIDGE_NAME" &> /dev/null; then
+            log_warn "Bridge $BRIDGE_NAME already exists"
+        else
+            sudo ip link add "$BRIDGE_NAME" type bridge
+            log_info "Created bridge: $BRIDGE_NAME"
+        fi
+        
+        sudo ip link set "$BRIDGE_NAME" up
+        log_info "Bridge $BRIDGE_NAME is UP"
+        
+        sudo ip addr add "$GATEWAY_IP" dev "$BRIDGE_NAME" 2>/dev/null || log_warn "IP already assigned"
+        log_info "Assigned IP $GATEWAY_IP to $BRIDGE_NAME"
+        
+        INTERNET_IFACE="eth0"
+
+        sudo iptables -C FORWARD -i "$BRIDGE_NAME" -o "$INTERNET_IFACE" -j ACCEPT 2>/dev/null || \
+        sudo iptables -I FORWARD -i "$BRIDGE_NAME" -o "$INTERNET_IFACE" -j ACCEPT
+
+        sudo iptables -C FORWARD -i "$INTERNET_IFACE" -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null || \
+        sudo iptables -I FORWARD -i "$INTERNET_IFACE" -o "$BRIDGE_NAME" -j ACCEPT
+        
+        # Allow traffic between subnets in the same VPC)
+        sudo iptables -C FORWARD -i "$BRIDGE_NAME" -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null || \
+        sudo iptables -I FORWARD -i "$BRIDGE_NAME" -o "$BRIDGE_NAME" -j ACCEPT
+        log_info "Added intra-VPC forwarding rule"
+
+        configure_nat "$CIDR" "$INTERNET_IFACE"
+
+        # Add isolation rules for other VPCs
+        log_info "Setting up VPC isolation"
+        for existing_vpc in .vpcctl-state/*.vpc; do
+            if [[ -f "$existing_vpc" ]] && [[ "$existing_vpc" != ".vpcctl-state/${VPC_NAME}.vpc" ]]; then
+                EXISTING_VPC_NAME=$(basename "$existing_vpc" .vpc)
+                EXISTING_BRIDGE="${EXISTING_VPC_NAME}-br"
+        
+                # Add DROP rules in both directions
+                sudo iptables -I FORWARD 1 -i "$BRIDGE_NAME" -o "$EXISTING_BRIDGE" -j DROP
+                sudo iptables -I FORWARD 1 -i "$EXISTING_BRIDGE" -o "$BRIDGE_NAME" -j DROP
+                log_info "Added isolation rules between $VPC_NAME and $EXISTING_VPC_NAME"
+            fi
+        done
+
+        mkdir -p .vpcctl-state
+        echo "$CIDR" > ".vpcctl-state/${VPC_NAME}.vpc"
+        
+        log_info "VPC $VPC_NAME created successfully!"
+        ;;
+        
+    create-subnet)
+        VPC_NAME=""
+        SUBNET_NAME=""
+        SUBNET_CIDR=""
+        SUBNET_TYPE="private"
+        
+        shift
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --vpc) VPC_NAME="$2"; shift 2 ;;
+                --name) SUBNET_NAME="$2"; shift 2 ;;
+                --cidr) SUBNET_CIDR="$2"; shift 2 ;;
+                --type) SUBNET_TYPE="$2"; shift 2 ;;
+                *) log_error "Unknown option: $1"; exit 1 ;;
+            esac
+        done
+        
+        if [[ -z "$VPC_NAME" ]] || [[ -z "$SUBNET_NAME" ]] || [[ -z "$SUBNET_CIDR" ]]; then
+            log_error "Missing required arguments"
+            echo "Usage: vpcctl create-subnet --vpc <vpc> --name <name> --cidr <cidr> [--type public|private]"
+            exit 1
+        fi
+        
+        if [[ ! -f ".vpcctl-state/${VPC_NAME}.vpc" ]]; then
+            log_error "VPC $VPC_NAME does not exist"
+            exit 1
+        fi
+        
+        BRIDGE_NAME="${VPC_NAME}-br"
+        NAMESPACE="${VPC_NAME}-${SUBNET_NAME}"
+        # Generate unique ID based on timestamp
+        VETH_ID=$(date +%s%N | md5sum | cut -c1-4)
+        VETH_NS="v${VETH_ID}"
+        VETH_BR="v${VETH_ID}b"
+        GATEWAY_IP=$(ip addr show "$BRIDGE_NAME" | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
+        
+        log_info "Creating subnet: $SUBNET_NAME in VPC: $VPC_NAME"
+        
+        if sudo ip netns list | grep -q "^${NAMESPACE}"; then
+            log_warn "Namespace $NAMESPACE already exists"
+        else
+            sudo ip netns add "$NAMESPACE"
+            log_info "Created namespace: $NAMESPACE"
+        fi
+        
+        # Delete the old device
+        if ip link show "$VETH_BR" &> /dev/null; then
+            log_warn "Veth pair already exists, deleting..."
+            sudo ip link del "$VETH_BR" 2>/dev/null || true
+        fi
+
+        sudo ip link add "$VETH_NS" type veth peer name "$VETH_BR"
+        log_info "Created veth pair: $VETH_NS <-> $VETH_BR"
+        
+        sudo ip link set "$VETH_NS" netns "$NAMESPACE"
+        log_info "Moved $VETH_NS to namespace $NAMESPACE"
+        
+        sudo ip link set "$VETH_BR" master "$BRIDGE_NAME"
+        log_info "Attached $VETH_BR to bridge $BRIDGE_NAME"
+        
+        sudo ip link set "$VETH_BR" up
+        sudo ip netns exec "$NAMESPACE" ip link set lo up
+        sudo ip netns exec "$NAMESPACE" ip link set "$VETH_NS" up
+        log_info "Interfaces are UP"
+        
+        sudo ip netns exec "$NAMESPACE" ip addr add "$SUBNET_CIDR" dev "$VETH_NS"
+        log_info "Assigned IP $SUBNET_CIDR to $VETH_NS"
+        
+        if [[ "$SUBNET_TYPE" == "public" ]]; then
+            sudo ip netns exec "$NAMESPACE" ip route add default via "$GATEWAY_IP"
+            log_info "Added default route via $GATEWAY_IP (public subnet)"
+        else
+            log_info "Private subnet - no default route added"
+        fi
+        
+        echo "$SUBNET_CIDR|$SUBNET_TYPE" > ".vpcctl-state/${VPC_NAME}-${SUBNET_NAME}.subnet"
+        log_info "Subnet $SUBNET_NAME created successfully!"
+        ;;
+        
+    peer-vpc)
+        VPC1_NAME=""
+        VPC2_NAME=""
+        
+        shift
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --vpc1) VPC1_NAME="$2"; shift 2 ;;
+                --vpc2) VPC2_NAME="$2"; shift 2 ;;
+                *) log_error "Unknown option: $1"; exit 1 ;;
+            esac
+        done
+        
+        if [[ -z "$VPC1_NAME" ]] || [[ -z "$VPC2_NAME" ]]; then
+            log_error "Missing required arguments"
+            echo "Usage: vpcctl peer-vpc --vpc1 <vpc1-name> --vpc2 <vpc2-name>"
+            exit 1
+        fi
+        
+        if [[ ! -f ".vpcctl-state/${VPC1_NAME}.vpc" ]]; then
+            log_error "VPC $VPC1_NAME does not exist"
+            exit 1
+        fi
+        
+        if [[ ! -f ".vpcctl-state/${VPC2_NAME}.vpc" ]]; then
+            log_error "VPC $VPC2_NAME does not exist"
+            exit 1
+        fi
+        
+        BRIDGE1="${VPC1_NAME}-br"
+        BRIDGE2="${VPC2_NAME}-br"
+        VPC1_CIDR=$(cat ".vpcctl-state/${VPC1_NAME}.vpc")
+        VPC2_CIDR=$(cat ".vpcctl-state/${VPC2_NAME}.vpc")
+        
+        PEER_VETH1="peer-${VPC1_NAME}-${VPC2_NAME}"
+        PEER_VETH2="peer-${VPC2_NAME}-${VPC1_NAME}"
+        
+        log_info "Creating VPC peering between $VPC1_NAME and $VPC2_NAME"
+        
+        # Create veth pair for peering
+        if ip link show "$PEER_VETH1" &> /dev/null; then
+            log_warn "Peering veth pair already exists"
+        else
+            sudo ip link add "$PEER_VETH1" type veth peer name "$PEER_VETH2"
+            log_info "Created peering veth pair: $PEER_VETH1 <-> $PEER_VETH2"
+        fi
+        
+        # Attach to bridges
+        sudo ip link set "$PEER_VETH1" master "$BRIDGE1"
+        sudo ip link set "$PEER_VETH2" master "$BRIDGE2"
+        log_info "Attached veth pair to bridges"
+        
+        # Bring up both ends
+        sudo ip link set "$PEER_VETH1" up
+        sudo ip link set "$PEER_VETH2" up
+        log_info "Peering interfaces are UP"
+        
+        # Get gateway IPs
+        GATEWAY1=$(ip addr show "$BRIDGE1" | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
+        GATEWAY2=$(ip addr show "$BRIDGE2" | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
+        
+        # Add routes in VPC1 namespaces to reach VPC2
+        log_info "Adding routes in VPC1 namespaces to reach VPC2"
+        for subnet_file in .vpcctl-state/${VPC1_NAME}-*.subnet; do
+            if [[ -f "$subnet_file" ]]; then
+                SUBNET_NAME=$(basename "$subnet_file" .subnet | sed "s/${VPC1_NAME}-//")
+                NAMESPACE="${VPC1_NAME}-${SUBNET_NAME}"
+                
+                sudo ip netns exec "$NAMESPACE" ip route add "$VPC2_CIDR" via "$GATEWAY1" 2>/dev/null || \
+                log_warn "Route to $VPC2_CIDR already exists in $NAMESPACE"
+                log_info "Added route to $VPC2_CIDR in $NAMESPACE"
+            fi
+        done
+        
+        # Add routes in VPC2 namespaces to reach VPC1
+        log_info "Adding routes in VPC2 namespaces to reach VPC1"
+        for subnet_file in .vpcctl-state/${VPC2_NAME}-*.subnet; do
+            if [[ -f "$subnet_file" ]]; then
+                SUBNET_NAME=$(basename "$subnet_file" .subnet | sed "s/${VPC2_NAME}-//")
+                NAMESPACE="${VPC2_NAME}-${SUBNET_NAME}"
+                
+                sudo ip netns exec "$NAMESPACE" ip route add "$VPC1_CIDR" via "$GATEWAY2" 2>/dev/null || \
+                log_warn "Route to $VPC1_CIDR already exists in $NAMESPACE"
+                log_info "Added route to $VPC1_CIDR in $NAMESPACE"
+            fi
+        done
+        
+        # Remove any DROP rules between the bridges
+        log_info "Removing isolation rules between VPCs"
+        sudo iptables -D FORWARD -i "$BRIDGE1" -o "$BRIDGE2" -j DROP 2>/dev/null || true
+        sudo iptables -D FORWARD -i "$BRIDGE2" -o "$BRIDGE1" -j DROP 2>/dev/null || true
+
+        # Add ACCEPT rules for peering traffic
+        sudo iptables -C FORWARD -i "$BRIDGE1" -o "$BRIDGE2" -j ACCEPT 2>/dev/null || \
+        sudo iptables -I FORWARD -i "$BRIDGE1" -o "$BRIDGE2" -j ACCEPT
+
+        sudo iptables -C FORWARD -i "$BRIDGE2" -o "$BRIDGE1" -j ACCEPT 2>/dev/null || \
+        sudo iptables -I FORWARD -i "$BRIDGE2" -o "$BRIDGE1" -j ACCEPT
+        log_info "Added ACCEPT rules for peering traffic"
+        
+        # Add routes on the host to enable inter-VPC routing
+        log_info "Adding host routes for VPC peering"
+        sudo ip route add "$VPC2_CIDR" dev "$BRIDGE2" 2>/dev/null || \
+        log_warn "Route to $VPC2_CIDR already exists on host"
+
+        sudo ip route add "$VPC1_CIDR" dev "$BRIDGE1" 2>/dev/null || \
+        log_warn "Route to $VPC1_CIDR already exists on host"
+
+        log_info "Host routes added for peering"
+
+        log_info "VPC peering established successfully between $VPC1_NAME and $VPC2_NAME!"
+        ;;
+        
+    unpeer-vpc)
+        VPC1_NAME=""
+        VPC2_NAME=""
+        
+        shift
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --vpc1) VPC1_NAME="$2"; shift 2 ;;
+                --vpc2) VPC2_NAME="$2"; shift 2 ;;
+                *) log_error "Unknown option: $1"; exit 1 ;;
+            esac
+        done
+        
+        if [[ -z "$VPC1_NAME" ]] || [[ -z "$VPC2_NAME" ]]; then
+            log_error "Missing required arguments"
+            echo "Usage: vpcctl unpeer-vpc --vpc1 <vpc1-name> --vpc2 <vpc2-name>"
+            exit 1
+        fi
+        
+        if [[ ! -f ".vpcctl-state/${VPC1_NAME}.vpc" ]]; then
+            log_error "VPC $VPC1_NAME does not exist"
+            exit 1
+        fi
+        
+        if [[ ! -f ".vpcctl-state/${VPC2_NAME}.vpc" ]]; then
+            log_error "VPC $VPC2_NAME does not exist"
+            exit 1
+        fi
+        
+        BRIDGE1="${VPC1_NAME}-br"
+        BRIDGE2="${VPC2_NAME}-br"
+        VPC1_CIDR=$(cat ".vpcctl-state/${VPC1_NAME}.vpc")
+        VPC2_CIDR=$(cat ".vpcctl-state/${VPC2_NAME}.vpc")
+        
+        PEER_VETH1="peer-${VPC1_NAME}-${VPC2_NAME}"
+        
+        log_info "Removing VPC peering between $VPC1_NAME and $VPC2_NAME"
+        
+        # Delete veth pair
+        if ip link show "$PEER_VETH1" &> /dev/null; then
+            sudo ip link del "$PEER_VETH1"
+            log_info "Deleted peering veth pair"
+        else
+            log_warn "Peering veth pair not found"
+        fi
+        
+        # Remove routes from VPC1 namespaces
+        log_info "Removing routes from VPC1 namespaces"
+        for subnet_file in .vpcctl-state/${VPC1_NAME}-*.subnet; do
+            if [[ -f "$subnet_file" ]]; then
+                SUBNET_NAME=$(basename "$subnet_file" .subnet | sed "s/${VPC1_NAME}-//")
+                NAMESPACE="${VPC1_NAME}-${SUBNET_NAME}"
+                
+                sudo ip netns exec "$NAMESPACE" ip route del "$VPC2_CIDR" 2>/dev/null || \
+                log_warn "Route to $VPC2_CIDR not found in $NAMESPACE"
+            fi
+        done
+        
+        # Remove routes from VPC2 namespaces
+        log_info "Removing routes from VPC2 namespaces"
+        for subnet_file in .vpcctl-state/${VPC2_NAME}-*.subnet; do
+            if [[ -f "$subnet_file" ]]; then
+                SUBNET_NAME=$(basename "$subnet_file" .subnet | sed "s/${VPC2_NAME}-//")
+                NAMESPACE="${VPC2_NAME}-${SUBNET_NAME}"
+        
+                sudo ip netns exec "$NAMESPACE" ip route del "$VPC1_CIDR" 2>/dev/null || \
+                log_warn "Route to $VPC1_CIDR not found in $NAMESPACE"
+            fi
+        done
+
+        # Remove host routes
+        log_info "Removing host routes for VPC peering"
+        sudo ip route del "$VPC2_CIDR" 2>/dev/null || true
+        sudo ip route del "$VPC1_CIDR" 2>/dev/null || true
+
+        # Remove ACCEPT rules
+        sudo iptables -D FORWARD -i "$BRIDGE1" -o "$BRIDGE2" -j ACCEPT 2>/dev/null || true
+        sudo iptables -D FORWARD -i "$BRIDGE2" -o "$BRIDGE1" -j ACCEPT 2>/dev/null || true
+
+        # Re-add DROP rules for isolation
+        log_info "Re-establishing VPC isolation"
+        sudo iptables -I FORWARD 1 -i "$BRIDGE1" -o "$BRIDGE2" -j DROP
+        sudo iptables -I FORWARD 1 -i "$BRIDGE2" -o "$BRIDGE1" -j DROP
+        
+        # Remove peering state
+        rm -f ".vpcctl-state/${VPC1_NAME}.peer"
+        rm -f ".vpcctl-state/${VPC2_NAME}.peer"
+        
+        log_info "VPC peering removed successfully between $VPC1_NAME and $VPC2_NAME!"
+        ;;
+    
+    delete-vpc)
+        VPC_NAME=""
+        
+        shift
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --name) VPC_NAME="$2"; shift 2 ;;
+                *) log_error "Unknown option: $1"; exit 1 ;;
+            esac
+        done
+        
+        if [[ -z "$VPC_NAME" ]]; then
+            log_error "Missing required argument: --name"
+            echo "Usage: vpcctl delete-vpc --name <vpc-name>"
+            exit 1
+        fi
+        
+        if [[ ! -f ".vpcctl-state/${VPC_NAME}.vpc" ]]; then
+            log_error "VPC $VPC_NAME does not exist"
+            exit 1
+        fi
+        
+        BRIDGE_NAME="${VPC_NAME}-br"
+        VPC_CIDR=$(cat ".vpcctl-state/${VPC_NAME}.vpc")
+        
+        log_info "Deleting VPC: $VPC_NAME"
+        
+        for subnet_file in .vpcctl-state/${VPC_NAME}-*.subnet; do
+            if [[ -f "$subnet_file" ]]; then
+                SUBNET_NAME=$(basename "$subnet_file" .subnet | sed "s/${VPC_NAME}-//")
+                NAMESPACE="${VPC_NAME}-${SUBNET_NAME}"
+                log_info "Deleting namespace: $NAMESPACE"
+                sudo ip netns del "$NAMESPACE" 2>/dev/null || log_warn "Namespace $NAMESPACE not found"
+                rm -f "$subnet_file"
+            fi
+        done
+        # Remove isolation rules with other VPCs
+        for existing_vpc in .vpcctl-state/*.vpc; do
+             if [[ -f "$existing_vpc" ]]; then
+                EXISTING_VPC_NAME=$(basename "$existing_vpc" .vpc)
+                EXISTING_BRIDGE="${EXISTING_VPC_NAME}-br"
+        
+                sudo iptables -D FORWARD -i "$BRIDGE_NAME" -o "$EXISTING_BRIDGE" -j DROP 2>/dev/null || true
+                sudo iptables -D FORWARD -i "$EXISTING_BRIDGE" -o "$BRIDGE_NAME" -j DROP 2>/dev/null || true
+            fi
+        done
+            if ip link show "$BRIDGE_NAME" &> /dev/null; then
+                sudo ip link del "$BRIDGE_NAME"
+                log_info "Deleted bridge: $BRIDGE_NAME"
+            fi
+        
+        log_info "Removing iptables rules"
+        sudo iptables -D FORWARD -i "$BRIDGE_NAME" -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null || true
+        sudo iptables -D FORWARD -i "$BRIDGE_NAME" -o eth0 -j ACCEPT 2>/dev/null || true
+        sudo iptables -D FORWARD -i eth0 -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null || true
+        sudo iptables -t nat -D POSTROUTING -s "$VPC_CIDR" -o eth0 -j MASQUERADE 2>/dev/null || true
+        
+        rm -f ".vpcctl-state/${VPC_NAME}.vpc"
+        log_info "VPC $VPC_NAME deleted successfully!"
+        ;;
+        
+    apply-sg)
+        VPC_NAME=""
+        SUBNET_NAME=""
+        POLICY_FILE=""
+        
+        shift
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --vpc) VPC_NAME="$2"; shift 2 ;;
+                --subnet) SUBNET_NAME="$2"; shift 2 ;;
+                --policy) POLICY_FILE="$2"; shift 2 ;;
+                *) log_error "Unknown option: $1"; exit 1 ;;
+            esac
+        done
+        
+        if [[ -z "$VPC_NAME" ]] || [[ -z "$SUBNET_NAME" ]] || [[ -z "$POLICY_FILE" ]]; then
+            log_error "Missing required arguments"
+            echo "Usage: vpcctl apply-sg --vpc <vpc-name> --subnet <subnet-name> --policy <policy-file.json>"
+            exit 1
+        fi
+        
+        apply_security_group "$VPC_NAME" "$SUBNET_NAME" "$POLICY_FILE"
+        ;;
+        
+    list-sg)
+        VPC_NAME=""
+        SUBNET_NAME=""
+        
+        shift
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --vpc) VPC_NAME="$2"; shift 2 ;;
+                --subnet) SUBNET_NAME="$2"; shift 2 ;;
+                *) log_error "Unknown option: $1"; exit 1 ;;
+            esac
+        done
+        
+        if [[ -z "$VPC_NAME" ]] || [[ -z "$SUBNET_NAME" ]]; then
+            log_error "Missing required arguments"
+            echo "Usage: vpcctl list-sg --vpc <vpc-name> --subnet <subnet-name>"
+            exit 1
+        fi
+        
+        list_security_groups "$VPC_NAME" "$SUBNET_NAME"
+        ;;
+        
+    remove-sg)
+        VPC_NAME=""
+        SUBNET_NAME=""
+        
+        shift
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --vpc) VPC_NAME="$2"; shift 2 ;;
+                --subnet) SUBNET_NAME="$2"; shift 2 ;;
+                *) log_error "Unknown option: $1"; exit 1 ;;
+            esac
+        done
+        
+        if [[ -z "$VPC_NAME" ]] || [[ -z "$SUBNET_NAME" ]]; then
+            log_error "Missing required arguments"
+            echo "Usage: vpcctl remove-sg --vpc <vpc-name> --subnet <subnet-name>"
+            exit 1
+        fi
+        
+        remove_security_group "$VPC_NAME" "$SUBNET_NAME"
+        ;;
+    deploy-app)
+        VPC_NAME=""
+        SUBNET_NAME=""
+        APP_TYPE="nginx"
+        PORT="80"
+        
+        shift
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --vpc) VPC_NAME="$2"; shift 2 ;;
+                --subnet) SUBNET_NAME="$2"; shift 2 ;;
+                --type) APP_TYPE="$2"; shift 2 ;;
+                --port) PORT="$2"; shift 2 ;;
+                *) log_error "Unknown option: $1"; exit 1 ;;
+            esac
+        done
+        
+        if [[ -z "$VPC_NAME" ]] || [[ -z "$SUBNET_NAME" ]]; then
+            log_error "Missing required arguments"
+            echo "Usage: vpcctl deploy-app --vpc <vpc-name> --subnet <subnet-name> [--type nginx] [--port 80]"
+            exit 1
+        fi
+        
+        deploy_app "$VPC_NAME" "$SUBNET_NAME" "$APP_TYPE" "$PORT"
+        ;;
+        
+    cleanup-app)
+        VPC_NAME=""
+        SUBNET_NAME=""
+        
+        shift
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --vpc) VPC_NAME="$2"; shift 2 ;;
+                --subnet) SUBNET_NAME="$2"; shift 2 ;;
+                *) log_error "Unknown option: $1"; exit 1 ;;
+            esac
+        done
+        
+        if [[ -z "$VPC_NAME" ]] || [[ -z "$SUBNET_NAME" ]]; then
+            log_error "Missing required arguments"
+            echo "Usage: vpcctl cleanup-app --vpc <vpc-name> --subnet <subnet-name>"
+            exit 1
+        fi
+        
+        cleanup_app "$VPC_NAME" "$SUBNET_NAME"
+        ;;
+        
+    list-apps)
+        list_apps
+        ;;
+    *)
+        echo "Usage: vpcctl {create-vpc|create-subnet|peer-vpc|unpeer-vpc|delete-vpc|apply-sg|list-sg|remove-sg|deploy-app|cleanup-app|list-apps}"
+        exit 1
+        ;;
+esac

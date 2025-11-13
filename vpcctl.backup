@@ -1,0 +1,314 @@
+#!/bin/bash
+
+set -e  
+
+log_info() {
+
+log_error() {
+    echo "[ERROR] $1"
+}
+
+log_warn() {
+    echo "[WARN] $1"
+}
+
+#  Function to configure NAT for a VPC
+configure_nat() {
+    local VPC_CIDR=$1
+    local INTERNET_IFACE=$2
+    
+    log_info "Configuring NAT for $VPC_CIDR via $INTERNET_IFACE"
+    
+    # Enable IP forwarding
+    sudo sysctl -w net.ipv4.ip_forward=1 > /dev/null
+    
+    # MASQUERADE rule
+    sudo iptables -t nat -C POSTROUTING -s "$VPC_CIDR" -o "$INTERNET_IFACE" -j MASQUERADE 2>/dev/null || \
+    sudo iptables -t nat -A POSTROUTING -s "$VPC_CIDR" -o "$INTERNET_IFACE" -j MASQUERADE
+    
+    log_info "NAT configured"
+}
+
+
+case "$1" in
+    create-vpc)
+    # Parse arguments
+    VPC_NAME=""
+    CIDR=""
+    
+    shift  # Remove 'create-vpc' from arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --name)
+                VPC_NAME="$2"
+                shift 2
+                ;;
+            --cidr)
+                CIDR="$2"
+                shift 2
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Validate inputs
+    if [[ -z "$VPC_NAME" ]] || [[ -z "$CIDR" ]]; then
+        log_error "Missing required arguments"
+        echo "Usage: vpcctl create-vpc --name <name> --cidr <cidr>"
+        exit 1
+    fi
+    
+    BRIDGE_NAME="${VPC_NAME}-br"
+    GATEWAY_IP="${CIDR%.*}.1/24"  # Extract gateway IP 
+    
+    log_info "Creating VPC: $VPC_NAME with CIDR: $CIDR"
+    
+    # Create bridge
+    if ip link show "$BRIDGE_NAME" &> /dev/null; then
+        log_warn "Bridge $BRIDGE_NAME already exists"
+    else
+        sudo ip link add "$BRIDGE_NAME" type bridge
+        log_info "Created bridge: $BRIDGE_NAME"
+    fi
+    
+    # Bring bridge up
+    sudo ip link set "$BRIDGE_NAME" up
+    log_info "Bridge $BRIDGE_NAME is UP"
+    
+    # Assign IP to bridge
+    sudo ip addr add "$GATEWAY_IP" dev "$BRIDGE_NAME" 2>/dev/null || log_warn "IP already assigned"
+    log_info "Assigned IP $GATEWAY_IP to $BRIDGE_NAME"
+    
+    # Allow forwarding through bridge
+    sudo iptables -C FORWARD -i "$BRIDGE_NAME" -j ACCEPT 2>/dev/null || \
+    sudo iptables -A FORWARD -i "$BRIDGE_NAME" -j ACCEPT
+
+    sudo iptables -C FORWARD -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null || \
+    sudo iptables -A FORWARD -o "$BRIDGE_NAME" -j ACCEPT
+
+    # Configure NAT (after "VPC created successfully" line)
+    INTERNET_IFACE="eth0"  # Your internet interface
+    configure_nat "$CIDR" "$INTERNET_IFACE"
+
+    # Save VPC metadata
+    mkdir -p .vpcctl-state
+    echo "$CIDR" > ".vpcctl-state/${VPC_NAME}.vpc"
+    
+    log_info "VPC $VPC_NAME created successfully!"
+        
+        ;;
+    create-subnet)
+    # Parse arguments
+    VPC_NAME=""
+    SUBNET_NAME=""
+    SUBNET_CIDR=""
+    SUBNET_TYPE="private"  # default
+    
+    shift
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --vpc)
+                VPC_NAME="$2"
+                shift 2
+                ;;
+            --name)
+                SUBNET_NAME="$2"
+                shift 2
+                ;;
+            --cidr)
+                SUBNET_CIDR="$2"
+                shift 2
+                ;;
+            --type)
+                SUBNET_TYPE="$2"
+                shift 2
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Validate
+    if [[ -z "$VPC_NAME" ]] || [[ -z "$SUBNET_NAME" ]] || [[ -z "$SUBNET_CIDR" ]]; then
+        log_error "Missing required arguments"
+        echo "Usage: vpcctl create-subnet --vpc <vpc> --name <name> --cidr <cidr> [--type public|private]"
+        exit 1
+    fi
+    
+    # Check if VPC exists
+    if [[ ! -f ".vpcctl-state/${VPC_NAME}.vpc" ]]; then
+        log_error "VPC $VPC_NAME does not exist"
+        exit 1
+    fi
+    
+    BRIDGE_NAME="${VPC_NAME}-br"
+    NAMESPACE="${VPC_NAME}-${SUBNET_NAME}"
+    # Count existing veths to generate unique number
+    VETH_COUNT=$(ip link show | grep -c "^[0-9]*: v" || echo 0)
+    VETH_NS="v${VETH_COUNT}"
+    VETH_BR="v${VETH_COUNT}b"
+    SUBNET_IP="${SUBNET_CIDR%/*}"  # Get IP without /24
+    GATEWAY_IP=$(ip addr show "$BRIDGE_NAME" | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
+    
+    log_info "Creating subnet: $SUBNET_NAME in VPC: $VPC_NAME"
+    
+    # Create namespace
+    if sudo ip netns list | grep -q "^${NAMESPACE}"; then
+        log_warn "Namespace $NAMESPACE already exists"
+    else
+        sudo ip netns add "$NAMESPACE"
+        log_info "Created namespace: $NAMESPACE"
+    fi
+    
+    # Create veth pair
+    if ip link show "$VETH_BR" &> /dev/null; then
+        log_warn "Veth pair already exists"
+    else
+        sudo ip link add "$VETH_NS" type veth peer name "$VETH_BR"
+        log_info "Created veth pair: $VETH_NS <-> $VETH_BR"
+    fi
+    
+    # Move one end to namespace
+    sudo ip link set "$VETH_NS" netns "$NAMESPACE"
+    log_info "Moved $VETH_NS to namespace $NAMESPACE"
+    
+    # Attach other end to bridge
+    sudo ip link set "$VETH_BR" master "$BRIDGE_NAME"
+    log_info "Attached $VETH_BR to bridge $BRIDGE_NAME"
+    
+    # Bring interfaces up
+    sudo ip link set "$VETH_BR" up
+    sudo ip netns exec "$NAMESPACE" ip link set lo up
+    sudo ip netns exec "$NAMESPACE" ip link set "$VETH_NS" up
+    log_info "Interfaces are UP"
+    
+    # Assign IP
+    sudo ip netns exec "$NAMESPACE" ip addr add "$SUBNET_CIDR" dev "$VETH_NS"
+    log_info "Assigned IP $SUBNET_CIDR to $VETH_NS"
+    
+    # Add default route if public subnet
+    if [[ "$SUBNET_TYPE" == "public" ]]; then
+        sudo ip netns exec "$NAMESPACE" ip route add default via "$GATEWAY_IP"
+        log_info "Added default route via $GATEWAY_IP (public subnet)"
+    else
+        log_info "Private subnet - no default route added"
+    fi
+    
+    # Save subnet metadata
+    echo "$SUBNET_CIDR|$SUBNET_TYPE" > ".vpcctl-state/${VPC_NAME}-${SUBNET_NAME}.subnet"
+    
+    log_info "Subnet $SUBNET_NAME created successfully!"
+    ;;
+    delete-vpc)
+    VPC_NAME=""
+    
+    shift
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --name)
+                VPC_NAME="$2"
+                shift 2
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                exit 1
+                ;;
+        esac
+    done
+    
+    if [[ -z "$VPC_NAME" ]]; then
+        log_error "Missing required argument: --name"
+        echo "Usage: vpcctl delete-vpc --name <vpc-name>"
+        exit 1
+    fi
+    
+    if [[ ! -f ".vpcctl-state/${VPC_NAME}.vpc" ]]; then
+        log_error "VPC $VPC_NAME does not exist"
+        exit 1
+    fi
+    
+    BRIDGE_NAME="${VPC_NAME}-br"
+    VPC_CIDR=$(cat ".vpcctl-state/${VPC_NAME}.vpc")
+    
+    log_info "Deleting VPC: $VPC_NAME"
+    
+    # Delete all subnets for this VPC
+    for subnet_file in .vpcctl-state/${VPC_NAME}-*.subnet; do
+        if [[ -f "$subnet_file" ]]; then
+            SUBNET_NAME=$(basename "$subnet_file" .subnet | sed "s/${VPC_NAME}-//")
+            NAMESPACE="${VPC_NAME}-${SUBNET_NAME}"
+            
+            log_info "Deleting namespace: $NAMESPACE"
+            sudo ip netns del "$NAMESPACE" 2>/dev/null || log_warn "Namespace $NAMESPACE not found"
+            
+            rm -f "$subnet_file"
+        fi
+    done
+    
+    # Delete bridge (this automatically removes attached veth interfaces)
+    if ip link show "$BRIDGE_NAME" &> /dev/null; then
+        sudo ip link del "$BRIDGE_NAME"
+        log_info "Deleted bridge: $BRIDGE_NAME"
+    fi
+    
+    # Remove iptables rules
+    log_info "Removing iptables rules"
+    sudo iptables -D FORWARD -i "$BRIDGE_NAME" -j ACCEPT 2>/dev/null || true
+    sudo iptables -D FORWARD -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null || true
+    sudo iptables -t nat -D POSTROUTING -s "$VPC_CIDR" -o eth0 -j MASQUERADE 2>/dev/null || true
+    
+    # Delete VPC metadata
+    rm -f ".vpcctl-state/${VPC_NAME}.vpc"
+    
+    log_info "VPC $VPC_NAME deleted successfully!"
+    ;;
+    list-vpcs)
+    log_info "Listing all VPCs..."
+    echo ""
+    
+    if [[ ! -d ".vpcctl-state" ]] || [[ -z "$(ls -A .vpcctl-state/*.vpc 2>/dev/null)" ]]; then
+        echo "No VPCs found."
+        exit 0
+    fi
+    
+    for vpc_file in .vpcctl-state/*.vpc; do
+        VPC_NAME=$(basename "$vpc_file" .vpc)
+        VPC_CIDR=$(cat "$vpc_file")
+        BRIDGE_NAME="${VPC_NAME}-br"
+        
+        echo "VPC: $VPC_NAME"
+        echo "  CIDR: $VPC_CIDR"
+        echo "  Bridge: $BRIDGE_NAME"
+        
+        # List subnets
+        echo "  Subnets:"
+        subnet_found=false
+        for subnet_file in .vpcctl-state/${VPC_NAME}-*.subnet; do
+            if [[ -f "$subnet_file" ]]; then
+                subnet_found=true
+                SUBNET_NAME=$(basename "$subnet_file" .subnet | sed "s/${VPC_NAME}-//")
+                SUBNET_INFO=$(cat "$subnet_file")
+                SUBNET_CIDR=$(echo "$SUBNET_INFO" | cut -d'|' -f1)
+                SUBNET_TYPE=$(echo "$SUBNET_INFO" | cut -d'|' -f2)
+                
+                echo "    - $SUBNET_NAME ($SUBNET_TYPE): $SUBNET_CIDR"
+            fi
+        done
+        
+        if [[ "$subnet_found" == false ]]; then
+            echo "    (no subnets)"
+        fi
+        
+        echo ""
+    done
+    ;;
+    *)
+        echo "Usage: vpcctl {create-vpc|create-subnet|delete-vpc|list-vpcs}"
+        exit 1
+        ;;
+esac

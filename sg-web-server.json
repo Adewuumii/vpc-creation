@@ -1,0 +1,54 @@
+{
+  "name": "web-server-sg",
+  "description": "Security group for web servers - allows HTTP/HTTPS, blocks SSH",
+  "ingress": [
+    {
+      "port": 80,
+      "protocol": "tcp",
+      "source": "0.0.0.0/0",
+      "action": "ACCEPT",
+      "comment": "Allow HTTP from anywhere"
+    },
+    {
+      "port": 443,
+      "protocol": "tcp",
+      "source": "0.0.0.0/0",
+      "action": "ACCEPT",
+      "comment": "Allow HTTPS from anywhere"
+    },
+    {
+      "protocol": "icmp",
+      "action": "ACCEPT",
+      "comment": "Allow ping for testing"
+    },
+    {
+      "port": 22,
+      "protocol": "tcp",
+      "action": "DROP",
+      "comment": "Block SSH from anywhere"
+    }
+  ],
+  "egress": [
+    {
+      "port": 80,
+      "protocol": "tcp",
+      "action": "ACCEPT",
+      "comment": "Allow outbound HTTP"
+    },
+    {
+      "port": 443,
+      "protocol": "tcp",
+      "action": "ACCEPT",
+      "comment": "Allow outbound HTTPS"
+    },
+    {
+      "protocol": "icmp",
+      "action": "ACCEPT",
+      "comment": "Allow outbound ping"
+    }
+  ],
+  "default_policy": {
+    "ingress": "DROP",
+    "egress": "ACCEPT"
+  }
+}

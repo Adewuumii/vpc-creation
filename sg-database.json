@@ -1,0 +1,29 @@
+{
+  "name": "database-sg",
+  "description": "Security group for database servers - only allows access from app subnet",
+  "ingress": [
+    {
+      "port": 3306,
+      "protocol": "tcp",
+      "source": "10.0.1.0/24",
+      "action": "ACCEPT",
+      "comment": "Allow MySQL from app subnet only"
+    },
+    {
+      "protocol": "icmp",
+      "source": "10.0.1.0/24",
+      "action": "ACCEPT",
+      "comment": "Allow ping from app subnet"
+    }
+  ],
+  "egress": [
+    {
+      "action": "ACCEPT",
+      "comment": "Allow all outbound traffic"
+    }
+  ],
+  "default_policy": {
+    "ingress": "DROP",
+    "egress": "ACCEPT"
+  }
+}
