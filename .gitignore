@@ -1,1 +1,3 @@
 test-complete-vpc.sh
+
+.vpcctl-state
