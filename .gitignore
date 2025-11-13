@@ -1,3 +1,10 @@
 test-complete-vpc.sh
-
 .vpcctl-state/
+*.backup
+*.tmp
+*.log
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
